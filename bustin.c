@@ -227,44 +227,6 @@ walk_listhead(int fd, uint64_t ptroot, uint64_t vaddr, uint64_t offset,
 		 */
 		walk_func(fd, ptroot, next - offset, arg);
 	}
-
-#if 0
-	for (;;) {
-		char buf[16];
-		uint32_t expid;
-
-		fprintf(stdout, "PHASE2: walk visit %016llx\n",
-		    next);
-
-		/*
-		walk_func(fd, ptroot, next - offset, arg);
-		*/
-
-		vload(fd, ptroot, next - 44, sizeof (expid),
-		    (uint8_t *)&expid);
-		fprintf(stdout, "PHASE2: pid %u\n", expid);
-
-		vinspect(fd, ptroot, next - 44, 16);
-
-		if (vload(fd, ptroot, next - 44 + (COMM_OFFSET - PID_OFFSET),
-		    16, buf) != -1) {
-			fprintf(stdout, "PHASE2: walk comm %s\n", buf);
-		}
-
-		fprintf(stdout, "PS: %6d %s\n", expid, buf);
-
-		if (vload(fd, ptroot, next + 8, sizeof (next),
-		    (uint8_t *)&next) == -1) {
-			fprintf(stdout, "PHASE2: ERROR walk\n");
-			return;
-		}
-
-		if (next == vaddr) {
-			fprintf(stdout, "PHASE2: end walk\n");
-			return;
-		}
-	}
-#endif
 }
 
 typedef struct visit_child_state {
@@ -341,20 +303,7 @@ phase2(int fd, uint64_t ptroot)
 					    init_task, INIT_TASK);
 				}
 			}
-#if 0
-			fprintf(stdout, "PHASE2: read ptr %016llx\n",
-			    init_task);
-			vinspect(fd, ptroot, init_task, 1024);
-#endif
 		}
-
-#if 0
-		fprintf(stdout, "PHASE2: walk children:\n");
-		walk_listhead(fd, ptroot, pi->pi_addr_pid + 12 + 16);
-		fprintf(stdout, "PHASE2: walk siblings:\n");
-		walk_listhead(fd, ptroot, pi->pi_addr_pid + 12 + 16 + 8);
-#endif
-
 		fprintf(stdout, "PHASE2: \n");
 	}
 
@@ -382,15 +331,6 @@ phase2(int fd, uint64_t ptroot)
 
 	PID_OFFSET = COMM_OFFSET - pid_to_comm;
 	fprintf(stdout, "PHASE2: list offset %llx\n", PID_OFFSET + 12 + 16);
-
-	/*
-	for (pi = PROCINFO; pi != NULL; pi = pi->pi_next) {
-		fprintf(stdout, "PHASE2: comm      %s\n", pi->pi_comm);
-		fprintf(stdout, "PHASE2: walk children:\n");
-		walk_listhead(fd, ptroot, pi->pi_addr_pid + 28,
-		    PID_OFFSET + 44, visit_child, NULL);
-	}
-	*/
 
 	vcs0.vcs_depth = 0;
 	fprintf(stdout, "\n\nWALK CHILDREN STARTING AT INIT_TASK:\n\n");
@@ -420,14 +360,6 @@ find_process(int fd, uint64_t ptroot, char *comm, int expid, uint64_t vaddr,
 	if (vload(fd, ptroot, vaddr, pagesize, buf) == -1) {
 		return (-1);
 	}
-
-	/*
-	if ((sz = pread(fd, buf, pagesize, BASEA + physaddr)) != pagesize) {
-		fprintf(stderr, "sz: %d\n", sz);
-		perror("pread");
-		goto out;
-	}
-	*/
 
 	for (a = 16; a < pagesize; a += 8) {
 		uint64_t *load8_a, *load8_b;
@@ -565,19 +497,6 @@ inspect_kernel(int fd, uint64_t vaddr, uint64_t physaddr, uint64_t pagesize)
 
 		printf("\n");
 	}
-
-#if 0
-	for (i = 0; i < size; i++) {
-		uint8_t c = buf[i];
-		char cc = '.';
-
-		if (i % 8 == 0) {
-		}
-
-
-		printf(" %02x (%c) ", (unsigned int) c, cc);
-	}
-#endif
 	printf("\n");
 
 	if (getenv("DO_MDB") != NULL) {
@@ -619,18 +538,6 @@ look_here(int fd, uint64_t vaddr, uint64_t physaddr, uint64_t pagesize)
 	 */
 	if (vaddr >= 0xffffffffff5fa000)
 		return;
-
-	/*
-	if (grep_mem(fd, "kthreadd", vaddr, physaddr, pagesize) == 0) {
-		inspect_kernel(fd, vaddr, physaddr, pagesize);
-	}
-	*/
-
-	/*
-	 * XXX JMC OLD WAY
-	find_process(fd, "kthreadd", 2, vaddr, physaddr, pagesize);
-	find_process(fd, "init", 1, vaddr, physaddr, pagesize);
-	*/
 }
 
 static int
@@ -707,6 +614,33 @@ static char *indents[] = {
 };
 
 void
+print_pte(int level, int index, uint64_t vaddr, uint64_t pagesize,
+    uint64_t physaddr)
+{
+	char *label = pagesize == 2097152 ? "2M" :
+	    pagesize == 1073741824 ? "1G" :
+	    pagesize == 4096 ? "4K" :
+	    "PT";
+	static int print_pte = -1;
+
+	if (print_pte == -1)
+		print_pte = getenv("PRINT_PTE") != NULL ? 1 : 0;
+	if (!print_pte)
+		return;
+
+	if (strcmp(label, "PT") == 0) {
+		fprintf(stdout, "%d%s[%d] %016llx (%s)\n",
+		    level, indents[level], index,
+		    vaddr, label);
+	} else {
+		fprintf(stdout, "%d%s[%d] %016llx - %016llx (%s) :: %llx\n",
+		    level, indents[level], index,
+		    vaddr, vaddr + pagesize - 1, label,
+		    physaddr);
+	}
+}
+
+void
 walk_map(int fd, int level, uint64_t ptaddr, uint64_t base_vaddr)
 {
 	uint64_t i;
@@ -747,19 +681,13 @@ walk_map(int fd, int level, uint64_t ptaddr, uint64_t base_vaddr)
 			/*
 			 * This is a large page:
 			 */
-			char *label = level == 2 ? "2M" : "1G";
+			//char *label = level == 2 ? "2M" : "1G";
 			uint64_t pagesize = level == 2 ? 2097152 :
 			    1073741824;
 			uint64_t physaddr = pte & (level == 2 ? ADDRMASK_L2 :
 			    ADDRMASK_L3);
 
-#if 0
-			fprintf(stdout, "%d%s[%d] %016llx - %016llx (%s) :: "
-			    "%llx\n",
-			    level, indents[level], i,
-			    vaddr, vaddr + pagesize - 1, label,
-			    physaddr);
-#endif
+			print_pte(level, i, vaddr, pagesize, physaddr);
 
 			tlb_add(vaddr, physaddr, pagesize);
 			look_here(fd, vaddr, physaddr, pagesize);
@@ -769,22 +697,10 @@ walk_map(int fd, int level, uint64_t ptaddr, uint64_t base_vaddr)
 
 		nextaddr = (pte & ADDRMASK);
 		if (level > 1) {
-#if 0
-			fprintf(stdout, "%d%s[%d] %016llx :: pt @ %llx\n",
-			    level, indents[level], i,
-			    vaddr,
-			    nextaddr);
-#endif
+			print_pte(level, i, vaddr, 0, nextaddr);
 			walk_map(fd, level - 1, nextaddr, vaddr);
 		} else {
-#if 0
-			fprintf(stdout, "%d%s[%d] %016llx - %016llx (4K) "
-			    ":: %llx\n",
-			    level, indents[level], i,
-			    vaddr, vaddr + 4096 - 1,
-			    nextaddr);
-#endif
-
+			print_pte(level, i, vaddr, 4096, nextaddr);
 			tlb_add(vaddr, nextaddr, 4096);
 			look_here(fd, vaddr, nextaddr, 4096);
 		}
