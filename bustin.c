@@ -111,7 +111,7 @@ pload(int fd, uint64_t paddr, uint64_t size, void *buf)
 	size_t sz;
 
 	if ((sz = pread(fd, buf, size, BASEA + paddr)) != size) {
-		fprintf(stderr, "ERROR: pread fail\n");
+		fprintf(stdout, "ERROR: pread fail\n");
 		return (-1);
 	}
 
@@ -130,13 +130,13 @@ vload(int fd, uint64_t ptroot, uint64_t vaddr, uint64_t size, void *buf)
 		 *
 		 * tlb_add(...);
 		 */
-		fprintf(stderr, "COULD NOT FIND MAPPING FOR %016llx\n",
+		fprintf(stdout, "COULD NOT FIND MAPPING FOR %016llx\n",
 		    vaddr);
 		return (-1);
 	}
 
 	if ((vaddr + size) > (tlb->tlb_vaddr + tlb->tlb_pagesize)) {
-		fprintf(stderr, "ERROR: CANNOT READ %016llx + %llx FROM "
+		fprintf(stdout, "ERROR: CANNOT READ %016llx + %llx FROM "
 		    "PAGE AT %016llx + %llx\n", vaddr, size, tlb->tlb_vaddr,
 		    tlb->tlb_pagesize);
 		return (-1);
@@ -206,18 +206,20 @@ walk_listhead(int fd, uint64_t ptroot, uint64_t vaddr, uint64_t offset,
 		/*
 		 * Load next pointer from list_head:
 		 */
-		if (vload(fd, ptroot, next + 8, sizeof (next),
+		if (vload(fd, ptroot, next, sizeof (next),
 		    (uint8_t *)&next) == -1) {
 			fprintf(stdout, "PHASE2: ERROR walk\n");
 			return;
 		}
+
+		//fprintf(stdout, "PHASE2: %016llx walk %016llx\n", vaddr, next);
 
 		/*
 		 * If we've walked back to the list_head, then
 		 * we're done:
 		 */
 		if (next == vaddr) {
-			/*fprintf(stdout, "PHASE2: end walk\n");*/
+			//fprintf(stdout, "PHASE2: %016llx end walk\n", vaddr);
 			return;
 		}
 
@@ -232,6 +234,9 @@ walk_listhead(int fd, uint64_t ptroot, uint64_t vaddr, uint64_t offset,
 typedef struct visit_child_state {
 	int vcs_depth;
 } visit_child_state_t;
+
+uint64_t CHILDREN_OFFSET = 0;
+uint64_t SIBLING_OFFSET = 0;
 
 static void
 visit_child(int fd, uint64_t ptroot, uint64_t vaddr, void *arg)
@@ -254,9 +259,10 @@ visit_child(int fd, uint64_t ptroot, uint64_t vaddr, void *arg)
 	 * Walk Children:
 	 */
 	vcs1.vcs_depth = vcs->vcs_depth + 1;
-	walk_listhead(fd, ptroot, vaddr + PID_OFFSET + 28,
-	    PID_OFFSET + 44, visit_child, &vcs1);
+	walk_listhead(fd, ptroot, vaddr + PID_OFFSET + CHILDREN_OFFSET,
+	    PID_OFFSET + SIBLING_OFFSET, visit_child, &vcs1);
 }
+
 
 void
 phase2(int fd, uint64_t ptroot)
@@ -264,6 +270,7 @@ phase2(int fd, uint64_t ptroot)
 	procinfo_t *pi;
 	uint64_t pid_to_comm = 0;
 	visit_child_state_t vcs0;
+	uint64_t parent_offset = 0;
 
 	for (pi = PROCINFO; pi != NULL; pi = pi->pi_next) {
 		fprintf(stdout, "PHASE2: comm      %s\n", pi->pi_comm);
@@ -288,6 +295,43 @@ phase2(int fd, uint64_t ptroot)
 		fprintf(stdout, "PHASE2: \n");
 		{
 			uint64_t init_task, aa, bb;
+			uint64_t ptrptr = pi->pi_addr_pid + 8;
+			int x;
+
+			/* XXX 8-byte align; do this better */
+			while (ptrptr & 0x7)
+				ptrptr++;
+
+			/*
+			 * Look for a kernel text mapping pointer:
+			 * (i.e. ffffffff80000000 - ffffffffa0000000)
+			 *
+			 * This should be the parent task_struct ptr.
+			 */
+			for (x = 0; x < 4; ptrptr += 8, x++) {
+				uint64_t lp;
+
+				fprintf(stdout, "PHASE2: ptr from %016llx\n",
+				    ptrptr);
+				if (vload(fd, ptroot, ptrptr, sizeof (lp),
+				    &lp) == -1) {
+					continue;
+				}
+
+				if (lp >= 0xffffffff80000000 &&
+				    lp <= 0xffffffffa0000000) {
+					fprintf(stdout, "PHASE2: found "
+					    "text addr %016llx\n", lp);
+					INIT_TASK = lp;
+					parent_offset = ptrptr -
+					    pi->pi_addr_pid;
+					CHILDREN_OFFSET = parent_offset + 16;
+					SIBLING_OFFSET = CHILDREN_OFFSET + 16;
+					break;
+				}
+			}
+
+#if 0
 			fprintf(stdout, "PHASE2: ptr from %016llx\n",
 			    pi->pi_addr_pid + 12);
 			vload(fd, ptroot, pi->pi_addr_pid + 12,
@@ -303,6 +347,7 @@ phase2(int fd, uint64_t ptroot)
 					    init_task, INIT_TASK);
 				}
 			}
+#endif
 		}
 		fprintf(stdout, "PHASE2: \n");
 	}
@@ -330,25 +375,31 @@ phase2(int fd, uint64_t ptroot)
 	}
 
 	PID_OFFSET = COMM_OFFSET - pid_to_comm;
-	fprintf(stdout, "PHASE2: list offset %llx\n", PID_OFFSET + 12 + 16);
+	fprintf(stdout, "PHASE2: children offset %llx\n",
+	    PID_OFFSET + CHILDREN_OFFSET);
+	fprintf(stdout, "PHASE2: sibling offset %llx\n",
+	    PID_OFFSET + SIBLING_OFFSET);
 
 	vcs0.vcs_depth = 0;
 	fprintf(stdout, "\n\nWALK CHILDREN STARTING AT INIT_TASK:\n\n");
-	walk_listhead(fd, ptroot, INIT_TASK + PID_OFFSET + 28,
-	    PID_OFFSET + 44, visit_child, &vcs0);
+	walk_listhead(fd, ptroot, INIT_TASK + PID_OFFSET + CHILDREN_OFFSET,
+	    PID_OFFSET + SIBLING_OFFSET, visit_child, &vcs0);
 }
 
 static int
 find_process(int fd, uint64_t ptroot, char *comm, int expid, uint64_t vaddr,
     uint64_t pagesize)
 {
+	static int running = 0;
+
 	char comm2[16];
 	char *buf = alloca(pagesize);
-	char *buf_prev = alloca(pagesize);
 	uint64_t a;
 	size_t sz;
 	int ret = -1;
 	uint32_t expid32 = expid;
+
+	running++;
 
 	/*
 	 * Set up 16-byte NUL-terminated array for comparison with
@@ -358,19 +409,30 @@ find_process(int fd, uint64_t ptroot, char *comm, int expid, uint64_t vaddr,
 	strcpy(comm2, comm);
 
 	if (vload(fd, ptroot, vaddr, pagesize, buf) == -1) {
-		return (-1);
+		goto out;
 	}
 
 	for (a = 16; a < pagesize; a += 8) {
 		uint64_t *load8_a, *load8_b;
 		uint32_t *load4_a;
+		int found = 0;
+
+		uint64_t aaa, aast, aaen;
 
 		if (bcmp(buf + a, comm2, 16) != 0)
 			continue;
 
 		printf("FOUND comm \"%s\" @ %016llx\n", comm, vaddr + a);
 		if (strcmp(comm, "kthreadd") == 0) {
-			vinspect(fd, ptroot, vaddr, pagesize);
+			if (running == 1) {
+#if 0
+				vinspect(fd, ptroot, vaddr - pagesize,
+				    2 * pagesize);
+#endif
+				return (find_process(fd, ptroot, comm, expid,
+				    vaddr - pagesize,
+				    pagesize * 2));
+			}
 		}
 
 #if 0
@@ -384,39 +446,79 @@ find_process(int fd, uint64_t ptroot, char *comm, int expid, uint64_t vaddr,
 		printf("FOUND cred == real_cred @ %016llx\n", vaddr + a);
 #endif
 
-		for (load4_a = (uint32_t *)&buf[a - 16]; load4_a > 0;
-		    load4_a--) {
-			if (expid32 == *load4_a) {
-				uint64_t offs = (void*)load4_a - (void*)buf;
-				printf("FOUND expected tgid @ %016llx (%x)\n",
-				    vaddr + offs, a - offs);
+		aast = vaddr + a;
+		aaen = aast - 768;
+		for (aaa = aast; aaa >= aaen; aaa -= 4) {
+			uint32_t id;
 
-				load4_a--;
-				if (expid32 == *load4_a) {
+			if (vload(fd, ptroot, aaa, sizeof (id), &id) == -1)
+				continue;
+
+			if (expid32 == id) {
+				printf("FOUND expected tgid @ %016llx "
+				    "(%x)\n", aaa, aast - aaa);
+
+				if (vload(fd, ptroot, aaa - 4, sizeof (id),
+				    &id) == -1)
+					continue;
+
+				if (expid32 == id) {
 					procinfo_t *pi;
-					offs = (void*)load4_a - (void*)buf;
-					printf("FOUND expected pid @ "
-					    "%016llx (%x)\n",
-					    vaddr + offs, a - offs);
+
+					printf("FOUND expected pid @ %016llx "
+					    "(%x)\n", aaa - 4,
+					    aast - aaa - 4);
 
 					pi = calloc(1, sizeof (*pi));
 					pi->pi_comm = strdup(comm);
-					pi->pi_pid = *load4_a;
-					pi->pi_addr_comm = vaddr + a;
-					pi->pi_addr_pid = vaddr + offs;
+					pi->pi_pid = id;
+					pi->pi_addr_comm = aast;
+					pi->pi_addr_pid = aaa - 4;
 					procinfo_add(pi);
-				}
 
-				break;
+					found = 1;
+
+					break;
+				}
 			}
 		}
 
-		ret = 0;
-		goto out;
+#if 0
+		for (load4_a = (uint32_t *)&buf[a - 16]; load4_a > 0;
+		    load4_a--) {
+			procinfo_t *pi;
+			uint64_t offs = (void*)load4_a - (void*)buf - 4;
+
+			if (expid32 == *load4_a && expid32 == *(load4_a - 1)) {
+
+				printf("FOUND expected pid/tgid @ %016llx "
+				    "(%x)\n", vaddr + offs, a - offs);
+
+				pi = calloc(1, sizeof (*pi));
+				pi->pi_comm = strdup(comm);
+				pi->pi_pid = *load4_a;
+				pi->pi_addr_comm = vaddr + a;
+				pi->pi_addr_pid = vaddr + offs;
+				procinfo_add(pi);
+
+				found = 1;
+
+				break;
+			}
+
+			if (offs > 600)
+				break;
+		}
+#endif
+
+		if (found) {
+			ret = 0;
+			goto out;
+		}
 	}
 
 out:
-	free(buf);
+	running--;
 	return (ret);
 }
 
@@ -558,11 +660,14 @@ phase1(int fd, uint64_t ptroot)
 		if (!found2 && find_process(fd, ptroot, "kthreadd", 2, pos,
 		    4096) == 0) {
 			found2 = 1;
+			return (0);
 		}
+		/*
 		if (!found1 && find_process(fd, ptroot, "init", 1, pos,
 		    4096) == 0) {
 			found1 = 1;
 		}
+		*/
 
 		if (found1 && found2) {
 			fprintf(stdout, "FOUND BOTH init AND kthreadd\n");
